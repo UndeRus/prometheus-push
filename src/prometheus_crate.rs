@@ -4,6 +4,7 @@ use prometheus::core::Collector;
 use prometheus::proto::MetricFamily;
 use prometheus::Encoder;
 use prometheus::ProtobufEncoder;
+use prometheus::TextEncoder;
 use prometheus::Registry;
 use url::Url;
 
@@ -25,6 +26,74 @@ use reqwest::Client;
 
 #[cfg(feature = "with_reqwest_blocking")]
 use crate::blocking;
+
+pub struct PrometheusTextMetricsConverter;
+
+impl ConvertMetrics<Vec<MetricFamily>, Vec<Box<dyn Collector>>, Vec<u8>>
+    for PrometheusTextMetricsConverter
+{
+    fn metrics_from(&self, collectors: Vec<Box<dyn Collector>>) -> Result<Vec<MetricFamily>> {
+        let registry = Registry::new();
+        for collector in collectors {
+            registry.register(collector)?;
+        }
+
+        Ok(registry.gather())
+    }
+
+    fn create_push_details(
+        &self,
+        job: &str,
+        url: &Url,
+        grouping: &HashMap<&str, &str>,
+        metric_families: Vec<MetricFamily>,
+    ) -> Result<(Url, Vec<u8>, String)> {
+        let url = build_url(url, validate(job)?, grouping)?;
+        let encoder = TextEncoder::new();
+        let encoded_metrics = self.encode_metrics(&encoder, metric_families, grouping)?;
+
+        Ok((url, encoded_metrics, String::from(encoder.format_type())))
+    }
+}
+
+/// `PrometheusMetricsConverter` is a [`ConvertMetrics`] implementation that converts
+/// the given [`Collector`]s to a [`Vec`] of [`MetricFamily`] with text format that can
+/// be used to be pushed to the pushgateway.
+impl PrometheusTextMetricsConverter {
+    fn encode_metrics(
+        &self,
+        encoder: &TextEncoder,
+        metric_families: Vec<MetricFamily>,
+        grouping: &HashMap<&str, &str>,
+    ) -> Result<Vec<u8>> {
+        let mut encoded_metrics = Vec::new();
+        for metric_family in metric_families {
+            for metric in metric_family.get_metric() {
+                for label_pair in metric.get_label() {
+                    let label_name = label_pair.get_name();
+
+                    if LABEL_NAME_JOB == label_name {
+                        return Err(PushMetricsError::contains_label(
+                            metric_family.get_name(),
+                            LabelType::Job,
+                        ));
+                    }
+
+                    if grouping.contains_key(label_name) {
+                        return Err(PushMetricsError::contains_label(
+                            metric_family.get_name(),
+                            LabelType::Grouping(label_name),
+                        ));
+                    }
+                }
+            }
+
+            encoder.encode(&[metric_family], &mut encoded_metrics)?;
+        }
+
+        Ok(encoded_metrics)
+    }
+}
 
 /// `PrometheusMetricsConverter` is a [`ConvertMetrics`] implementation that converts
 /// the given [`Collector`]s to a [`Vec`] of [`MetricFamily`] that can be used to be
@@ -106,6 +175,15 @@ pub type PrometheusMetricsPusher = MetricsPusher<
 >;
 
 #[cfg(feature = "with_reqwest")]
+pub type PrometheusTextMetricsPusher = MetricsPusher<
+    PushClient,
+    PrometheusTextMetricsConverter,
+    Vec<MetricFamily>,
+    Vec<Box<dyn Collector>>,
+    Vec<u8>,
+>;
+
+#[cfg(feature = "with_reqwest")]
 impl<P, M, MF, C, B> MetricsPusher<P, M, MF, C, B>
 where
     P: Push<B>,
@@ -115,6 +193,10 @@ where
     /// of your pushgateway instance.
     pub fn from(client: Client, url: &Url) -> Result<PrometheusMetricsPusher> {
         MetricsPusher::new(PushClient::new(client), PrometheusMetricsConverter, url)
+    }
+
+    pub fn text_pusher_from(client: Client, url: &Url) -> Result<PrometheusTextMetricsPusher> {
+        MetricsPusher::new(PushClient::new(client), PrometheusTextMetricsConverter, url)
     }
 }
 
